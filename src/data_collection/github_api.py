@@ -84,12 +84,11 @@ def fetch_repo_metadata(full_name: str) -> dict | None:
 
 
 def fetch_open_issues(full_name: str, label: str = "good first issue", per_page: int = 50) -> list[dict]:
-    params = {"state": "open", "per_page": per_page}
-    if label:
-        params["labels"] = label
+    # Try labelled first; fall back to all open issues if none found
+    params = {"state": "open", "per_page": per_page, "labels": label}
     data = _get(f"{BASE_URL}/repos/{full_name}/issues", params=params)
     if not data:
-        return []
+        data = _get(f"{BASE_URL}/repos/{full_name}/issues", {"state": "open", "per_page": per_page}) or []
     return [
         {
             "repo": full_name,

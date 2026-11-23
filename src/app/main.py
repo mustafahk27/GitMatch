@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from src.recommendation.stage2_issues import rank_issues, build_user_profile_embedding
+from src.recommendation.stage2_issues import rank_issues, build_user_profile_embedding, _tfidf_matrix
 from src.data_collection.github_api import fetch_open_issues, fetch_user_pr_history
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -37,12 +37,16 @@ def _load_artifacts():
     eval_path = DATA_DIR / "eval_results.json"
     eval_results = json.loads(eval_path.read_text()) if eval_path.exists() else {}
 
+    desc_path = DATA_DIR / "repo_desc_index.json"
+    repo_desc_index = json.loads(desc_path.read_text()) if desc_path.exists() else {}
+
     _state["repo_index"] = repo_index
     _state["user_index"] = user_index
     _state["lang_index"] = lang_index
     _state["repo_lang_ids"] = repo_lang_ids
     _state["repo_embeddings"] = repo_embs / np.where(norms > 0, norms, 1)
     _state["eval_results"] = eval_results
+    _state["repo_desc_index"] = repo_desc_index
     _state["ready"] = True
 
 
@@ -88,6 +92,20 @@ def index():
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
+def _tfidf_match_repos(user_text: str, repo_desc_index: dict, repo_index: dict, top_n: int = 40) -> list[int]:
+    """Return indices of training repos most similar to user_text via TF-IDF."""
+    candidates = [(name, repo_index[name]) for name in repo_desc_index if name in repo_index]
+    if not candidates or not user_text.strip():
+        return []
+    names, idxs = zip(*candidates)
+    repo_texts = [repo_desc_index[n] for n in names]
+    all_docs = list(repo_texts) + [user_text]
+    matrix, _ = _tfidf_matrix(all_docs)
+    scores = matrix[:-1] @ matrix[-1]
+    top = np.argsort(scores)[::-1][:top_n]
+    return [idxs[i] for i in top if scores[i] > 0]
+
+
 def _cold_start_features(username: str, repo_index: dict, repo_embs: np.ndarray, lang_index: dict = None, repo_lang_ids=None) -> dict | None:
     """Build a minimal feature dict for a user not seen during training."""
     from src.data_collection.github_api import _get as gh_get
@@ -115,26 +133,43 @@ def _cold_start_features(username: str, repo_index: dict, repo_embs: np.ndarray,
 
     all_ids = list(set(owned_ids + pr_repo_ids + star_ids))
 
+    # Build a rich text profile from the user's PRs and their own repo descriptions
+    own_repo_texts = [
+        f"{r.get('description', '')} {r.get('language', '')}"
+        for r in data if not r.get("fork")
+    ]
+    user_text = " ".join(pr_titles + pr_descriptions + own_repo_texts)
+
     if all_ids:
         u_emb = repo_embs[all_ids].mean(axis=0)
         norm = np.linalg.norm(u_emb)
         u_emb = u_emb / norm if norm > 0 else u_emb
-    elif top_langs and lang_index is not None and repo_lang_ids is not None:
-        # Language-based fallback: mean-pool embeddings of repos matching the user's top languages
-        lang_ids_for_user = [lang_index[l] for l in top_langs if l in lang_index]
-        if lang_ids_for_user:
-            mask = np.isin(repo_lang_ids, lang_ids_for_user)
-            lang_embs = repo_embs[mask]
-            if len(lang_embs) > 0:
-                u_emb = lang_embs.mean(axis=0)
+        signal_source = "direct"
+    else:
+        # TF-IDF fallback: match user text against stored repo descriptions
+        repo_desc_index = _state.get("repo_desc_index", {})
+        tfidf_ids = _tfidf_match_repos(user_text, repo_desc_index, repo_index, top_n=40)
+        if tfidf_ids:
+            u_emb = repo_embs[tfidf_ids].mean(axis=0)
+            norm = np.linalg.norm(u_emb)
+            u_emb = u_emb / norm if norm > 0 else u_emb
+            all_ids = tfidf_ids
+            signal_source = "tfidf"
+        elif top_langs and lang_index is not None and repo_lang_ids is not None:
+            # Language-based fallback
+            lang_ids_for_user = [lang_index[l] for l in top_langs if l in lang_index]
+            if lang_ids_for_user:
+                mask = np.isin(repo_lang_ids, lang_ids_for_user)
+                lang_embs = repo_embs[mask]
+                u_emb = lang_embs.mean(axis=0) if len(lang_embs) > 0 else repo_embs.mean(axis=0)
                 norm = np.linalg.norm(u_emb)
                 u_emb = u_emb / norm if norm > 0 else u_emb
             else:
                 u_emb = repo_embs.mean(axis=0)
+            signal_source = "language"
         else:
             u_emb = repo_embs.mean(axis=0)
-    else:
-        u_emb = repo_embs.mean(axis=0)
+            signal_source = "global"
 
     # Build signal description for explanations
     signal_parts = []
@@ -142,7 +177,9 @@ def _cold_start_features(username: str, repo_index: dict, repo_embs: np.ndarray,
         signal_parts.append(f"contributed to {len(pr_repo_ids)} matched repos")
     if star_ids:
         signal_parts.append(f"starred {len(star_ids)} matched repos")
-    if not signal_parts and top_langs:
+    if not signal_parts and signal_source == "tfidf":
+        signal_parts.append(f"matches your project interests ({', '.join(top_langs[:2])})")
+    elif not signal_parts and top_langs:
         signal_parts.append(f"language profile ({', '.join(top_langs[:2])})")
 
     return {
