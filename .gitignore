@@ -29,3 +29,5 @@ data/processed/repo_metadata.jsonl
 
 # OS
 .DS_Store
+.vercel
+.env*
