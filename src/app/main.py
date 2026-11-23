@@ -21,7 +21,7 @@ from src.recommendation.stage2_issues import rank_issues, build_user_profile_emb
 from src.data_collection.github_api import fetch_open_issues, fetch_user_pr_history
 
 MODEL_CACHE_DIR = Path(os.getenv("MODEL_CACHE_DIR", "/tmp/gitmatch_models"))
-HF_REPO_ID = os.getenv("HF_REPO_ID", "mustafahk27/gitmatch-models")
+HF_REPO_ID = os.getenv("HF_REPO_ID", "mustafak27/gitmatch-models")
 
 _state: dict = {}
 
@@ -41,7 +41,7 @@ def _load_artifacts():
     for fname in files:
         try:
             local[fname] = hf_hub_download(
-                repo_id=HF_REPO_ID, filename=fname, cache_dir=str(MODEL_CACHE_DIR)
+                repo_id=HF_REPO_ID, filename=fname, repo_type="model", cache_dir=str(MODEL_CACHE_DIR)
             )
         except Exception:
             return  # artifacts not yet uploaded
@@ -61,7 +61,9 @@ def _load_artifacts():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _load_artifacts()
+    import threading
+    t = threading.Thread(target=_load_artifacts, daemon=True)
+    t.start()
     yield
 
 

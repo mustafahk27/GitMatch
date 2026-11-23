@@ -12,6 +12,9 @@ import os
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 try:
     from huggingface_hub import HfApi, login
 except ImportError:
@@ -19,7 +22,7 @@ except ImportError:
     sys.exit(1)
 
 PROCESSED = Path("data/processed")
-HF_REPO_ID = os.getenv("HF_REPO_ID", "mustafahk27/gitmatch-models")
+HF_REPO_ID = os.getenv("HF_REPO_ID", "mustafak27/gitmatch-models")
 
 ARTIFACTS = [
     PROCESSED / "repo_embeddings.npy",
@@ -48,10 +51,10 @@ def main():
 
     # Create the repo if it doesn't exist
     try:
-        api.create_repo(repo_id=HF_REPO_ID, repo_type="dataset", exist_ok=True)
-        print(f"Repo ready: https://huggingface.co/datasets/{HF_REPO_ID}")
+        api.create_repo(repo_id=HF_REPO_ID, repo_type="model", exist_ok=True)
+        print(f"Repo ready: https://huggingface.co/{HF_REPO_ID}")
     except Exception as e:
-        print(f"WARNING: Could not create repo: {e}")
+        print(f"WARNING: Could not create repo (may already exist): {e}")
 
     missing = [f for f in ARTIFACTS if not f.exists()]
     if missing:
@@ -68,11 +71,11 @@ def main():
             path_or_fileobj=str(artifact),
             path_in_repo=artifact.name,
             repo_id=HF_REPO_ID,
-            repo_type="dataset",
+            repo_type="model",
         )
         print(f"  ✓ {artifact.name}")
 
-    print(f"\nAll artifacts uploaded to https://huggingface.co/datasets/{HF_REPO_ID}")
+    print(f"\nAll artifacts uploaded to https://huggingface.co/{HF_REPO_ID}")
 
 
 if __name__ == "__main__":
