@@ -8,6 +8,7 @@ Model artifacts are downloaded from HF Hub into /tmp on cold start.
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -261,32 +262,35 @@ def recommend(request: RecommendRequest):
         if len(top_repos) >= request.top_k_repos:
             break
 
-    # Stage 2 — rank open issues within each repo via HF Inference API
-    try:
-        user_emb = build_user_profile_embedding(
-            feat.get("pr_titles", []),
-            feat.get("pr_descriptions", []),
-        )
-        stage2_ok = True
-    except Exception:
-        user_emb = None
-        stage2_ok = False
+    # Stage 2 — fetch open issues for all repos in parallel, then TF-IDF rank
+    user_emb = build_user_profile_embedding(
+        feat.get("pr_titles", []),
+        feat.get("pr_descriptions", []),
+    )
 
-    results = []
-    for rec in top_repos:
-        if stage2_ok and user_emb is not None:
+    def _fetch_and_rank(rec):
+        try:
+            raw_issues = fetch_open_issues(rec["repo"])
+            ranked = rank_issues(raw_issues, user_emb, top_k=request.top_k_issues)
+            return rec, [IssueResult(**i) for i in ranked]
+        except Exception:
+            return rec, []
+
+    issue_map: dict[str, list] = {}
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(_fetch_and_rank, rec): rec["repo"] for rec in top_repos}
+        for future in as_completed(futures, timeout=7):
             try:
-                raw_issues = fetch_open_issues(rec["repo"])
-                ranked = rank_issues(raw_issues, user_emb, top_k=request.top_k_issues)
-                issue_results = [IssueResult(**i) for i in ranked]
+                rec, issues = future.result()
+                issue_map[rec["repo"]] = issues
             except Exception:
-                issue_results = []
-        else:
-            issue_results = []
-        results.append(RepoResult(
+                issue_map[futures[future]] = []
+
+    return [
+        RepoResult(
             repo=rec["repo"],
             explanation=rec["explanation"],
-            issues=issue_results,
-        ))
-
-    return results
+            issues=issue_map.get(rec["repo"], []),
+        )
+        for rec in top_repos
+    ]
