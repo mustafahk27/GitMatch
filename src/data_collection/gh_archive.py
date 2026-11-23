@@ -108,16 +108,35 @@ def process_archive(start: str, end: str):
             print(f"  Skip {date}-{hour}: {e}")
             continue
 
-        with gzip.open(gz_path, "rt", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                parsed = parse_event(event)
-                if parsed:
-                    key = (parsed["user"], parsed["repo"])
-                    interactions[key] = interactions.get(key, 0.0) + parsed["weight"]
+        try:
+            with gzip.open(gz_path, "rt", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    parsed = parse_event(event)
+                    if parsed:
+                        key = (parsed["user"], parsed["repo"])
+                        interactions[key] = interactions.get(key, 0.0) + parsed["weight"]
+        except EOFError:
+            # File was truncated (download interrupted) — delete and retry once
+            print(f"  Truncated file {gz_path.name}, re-downloading ...")
+            gz_path.unlink()
+            try:
+                gz_path = download_hour(date, hour, RAW_DIR)
+                with gzip.open(gz_path, "rt", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        parsed = parse_event(event)
+                        if parsed:
+                            key = (parsed["user"], parsed["repo"])
+                            interactions[key] = interactions.get(key, 0.0) + parsed["weight"]
+            except Exception as e:
+                print(f"  Skip {date}-{hour} after retry: {e}")
 
     # Write out as TSV
     out_path = PROCESSED_DIR / "interactions_raw.tsv"
