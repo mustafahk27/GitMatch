@@ -24,8 +24,8 @@ import scipy.sparse as sp
 PROCESSED = Path("data/processed")
 RAW_TSV = PROCESSED / "interactions_raw.tsv"
 
-MIN_USER_REPOS = 5    # drop users with fewer distinct repos
-MIN_REPO_USERS = 10   # drop repos with fewer distinct users
+MIN_USER_REPOS = 2    # drop users with fewer distinct repos
+MIN_REPO_USERS = 3    # drop repos with fewer distinct users
 
 
 def load_raw(path: Path) -> dict[tuple[str, str], float]:

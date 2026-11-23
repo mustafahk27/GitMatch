@@ -33,8 +33,15 @@ def get_headers() -> dict:
 
 def _get(url: str, params: dict = None) -> dict | list | None:
     headers = get_headers()
-    for attempt in range(3):
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
+    for attempt in range(5):
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=30)
+        except (requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectionError) as exc:
+            wait = 2 ** attempt
+            print(f"  Network error ({exc.__class__.__name__}), retry {attempt+1}/5 in {wait}s")
+            time.sleep(wait)
+            continue
         if resp.status_code == 200:
             return resp.json()
         if resp.status_code == 403:
@@ -117,11 +124,27 @@ def collect_repo_metadata(repo_list_path: str):
     repos = Path(repo_list_path).read_text().strip().splitlines()
 
     out_path = PROCESSED_DIR / "repo_metadata.jsonl"
-    with open(out_path, "w") as f:
+
+    # Resume: load already-fetched repos so we skip them on restart
+    already_done: set[str] = set()
+    if out_path.exists():
+        with open(out_path) as f:
+            for line in f:
+                try:
+                    already_done.add(json.loads(line)["repo"])
+                except Exception:
+                    pass
+        print(f"Resuming — {len(already_done)} repos already fetched, {len(repos) - len(already_done)} remaining")
+
+    with open(out_path, "a") as f:
         for repo in tqdm(repos, desc="Fetching repo metadata"):
-            meta = fetch_repo_metadata(repo.strip())
+            repo = repo.strip()
+            if repo in already_done:
+                continue
+            meta = fetch_repo_metadata(repo)
             if meta:
                 f.write(json.dumps(meta) + "\n")
+                f.flush()
 
     print(f"Wrote metadata for repos to {out_path}")
 

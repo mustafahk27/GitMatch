@@ -13,6 +13,8 @@ data/raw/
 data/processed/*.npy
 data/processed/*.npz
 data/processed/*.pt
+data/processed/interactions_raw.tsv
+data/processed/repo_metadata.jsonl
 
 # Jupyter
 .ipynb_checkpoints/

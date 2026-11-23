@@ -93,15 +93,24 @@ def build_positives_list(matrix: sp.csr_matrix, user_features: dict, user_index:
     return positives
 
 
-def evaluate_all(models_dict: dict, test_gt: dict[int, set], repo_ids: list[str], n_repos: int) -> dict:
+def evaluate_all(models_dict: dict, test_gt: dict[int, set], train_matrix: sp.csr_matrix, repo_ids: list[str], n_repos: int) -> dict:
     results = {}
+    idx_to_repo = {i: r for i, r in enumerate(repo_ids)}
+    # Pre-compute training history per user to exclude from recommendations
+    train_histories: dict[int, list[int]] = {}
+    cx = train_matrix.tocsr()
+    for u in range(cx.shape[0]):
+        row = cx.getrow(u)
+        train_histories[u] = row.indices.tolist()
+
     for name, get_recs in models_dict.items():
         recs: dict[str, list] = {}
-        idx_to_repo = {i: r for i, r in enumerate(repo_ids)}
         for user_id, relevant in test_gt.items():
             if not relevant:
                 continue
-            rec_idxs = get_recs(user_id, list(relevant))
+            # Exclude training history so we only recommend unseen items
+            history = train_histories.get(user_id, [])
+            rec_idxs = get_recs(user_id, history)
             recs[str(user_id)] = [idx_to_repo[i] for i in rec_idxs]
         gt_named = {str(u): {idx_to_repo[r] for r in rel} for u, rel in test_gt.items()}
         summary = evaluate_model(recs, gt_named)
@@ -196,7 +205,7 @@ def main():
     with torch.no_grad():
         all_repo_embs = model.encode_repo(repo_embs_t.to(device), repo_lang_t.to(device)).cpu().numpy()
 
-    def nn_recs(user_id: int, exclude: list[int], k: int = 20) -> list[int]:
+    def nn_recs(user_id: int, train_history: list[int], k: int = 20) -> list[int]:
         username = idx_to_user.get(user_id)
         if username not in user_features:
             return []
@@ -207,17 +216,16 @@ def main():
         with torch.no_grad():
             u_emb = model.encode_user(u_t.to(device), l_t.to(device), tp_t.to(device)).cpu().numpy()
         scores = (u_emb @ all_repo_embs.T).flatten()
-        excl = set(exclude)
+        excl = set(train_history)
         ranked = [i for i in np.argsort(scores)[::-1] if i not in excl]
         return ranked[:k]
 
-    def knn_recs(user_id: int, exclude: list[int], k: int = 20) -> list[int]:
-        history = [r for r in range(matrix.shape[1]) if train_matrix[user_id, r] > 0]
-        recs = knn.recommend(history, top_k=k, exclude=set(exclude))
+    def knn_recs(user_id: int, train_history: list[int], k: int = 20) -> list[int]:
+        recs = knn.recommend(train_history, top_k=k, exclude=set(train_history))
         return [idx for idx, _, _ in recs]
 
-    def pop_recs(user_id: int, exclude: list[int], k: int = 20) -> list[int]:
-        recs = pop.recommend([], top_k=k + len(exclude), exclude=set(exclude))
+    def pop_recs(user_id: int, train_history: list[int], k: int = 20) -> list[int]:
+        recs = pop.recommend([], top_k=k + len(train_history), exclude=set(train_history))
         return [idx for idx, _ in recs[:k]]
 
     all_results = evaluate_all(
@@ -227,6 +235,7 @@ def main():
             "Two-Tower NN": nn_recs,
         },
         test_gt,
+        train_matrix,
         repo_ids,
         n_repos=len(repo_ids),
     )
