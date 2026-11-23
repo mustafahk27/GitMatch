@@ -1,10 +1,15 @@
 """
 Build user feature dicts from filtered interactions + repo metadata.
 
+Also pre-computes a user_embedding (mean of contributed repo embeddings,
+L2-normalised) so the Vercel server can do pure-numpy dot-product retrieval
+without loading torch at serve time.
+
 Reads:  data/processed/interactions_filtered.tsv
         data/processed/repo_features.json
         data/processed/repo_index.json
         data/processed/lang_index.json
+        data/processed/repo_embeddings.npy   (optional — skipped if absent)
 Writes: data/processed/user_features.json
 
 Usage:
@@ -14,6 +19,8 @@ Usage:
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
+
+import numpy as np
 
 PROCESSED = Path("data/processed")
 MAX_LANG_IDS = 10
@@ -69,6 +76,25 @@ def main():
             "pr_titles": [],       # populated later from GitHub API if available
             "pr_descriptions": [],
         }
+
+    # Pre-compute user embeddings (mean of contributed repo embeddings) for numpy serving
+    emb_path = PROCESSED / "repo_embeddings.npy"
+    if emb_path.exists():
+        repo_embs = np.load(str(emb_path)).astype(np.float32)
+        repo_index_map: dict[str, int] = json.loads((PROCESSED / "repo_index.json").read_text())
+        for username, feat in user_features.items():
+            if username == "__config__":
+                continue
+            contrib_ids = feat.get("contributed_repo_ids", [])
+            valid_ids = [i for i in contrib_ids if i < len(repo_embs)]
+            if valid_ids:
+                u_emb = repo_embs[valid_ids].mean(axis=0)
+                norm = np.linalg.norm(u_emb)
+                u_emb = u_emb / norm if norm > 0 else u_emb
+                feat["user_embedding"] = u_emb.tolist()
+        print("  Pre-computed user embeddings (mean of contributed repos)")
+    else:
+        print("  repo_embeddings.npy not found — run embed_repos.py first to add user_embedding")
 
     # Store config so the app can re-instantiate the model
     user_features["__config__"] = {

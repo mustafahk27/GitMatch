@@ -1,84 +1,73 @@
 """
-FastAPI web app for GitMatch.
+FastAPI web app for GitMatch — lightweight Vercel deployment.
 
-Models are stored on Hugging Face Hub (mustafahk27/gitmatch-models) and
-downloaded on first request into /tmp (the only writable path on Vercel).
+At serve time: pure numpy dot products for Stage 1 (no torch).
+Stage 2 uses the HF Inference API for issue embeddings.
+Model artifacts are downloaded from HF Hub into /tmp on cold start.
 """
 
+import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import numpy as np
-import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from src.models.two_tower import TwoTowerModel
-from src.models.knn_baseline import ItemKNN
-from src.recommendation.stage1_repos import recommend_repos
 from src.recommendation.stage2_issues import rank_issues, build_user_profile_embedding
 from src.data_collection.github_api import fetch_open_issues
 
-# Vercel is read-only except /tmp
 MODEL_CACHE_DIR = Path(os.getenv("MODEL_CACHE_DIR", "/tmp/gitmatch_models"))
 HF_REPO_ID = os.getenv("HF_REPO_ID", "mustafahk27/gitmatch-models")
 
 _state: dict = {}
 
 
-def _load_models():
-    """Download model artifacts from HF Hub if not cached, then load into memory."""
+def _load_artifacts():
     try:
         from huggingface_hub import hf_hub_download
     except ImportError:
-        return  # huggingface_hub not installed — models unavailable
+        return
 
     MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    files = ["two_tower.pt", "repo_embeddings.npy", "repo_lang_ids.npy",
-             "repo_index.json", "user_index.json", "user_features.json", "knn_similarity.npz"]
+    files = [
+        "repo_embeddings.npy", "repo_lang_ids.npy",
+        "repo_index.json", "user_index.json", "user_features.json",
+    ]
     local = {}
     for fname in files:
         try:
-            local[fname] = hf_hub_download(repo_id=HF_REPO_ID, filename=fname, cache_dir=str(MODEL_CACHE_DIR))
+            local[fname] = hf_hub_download(
+                repo_id=HF_REPO_ID, filename=fname, cache_dir=str(MODEL_CACHE_DIR)
+            )
         except Exception:
-            return  # artifact not yet uploaded — stay in stub mode
-
-    import json, scipy.sparse as sp
+            return  # artifacts not yet uploaded
 
     _state["repo_index"] = json.loads(Path(local["repo_index.json"]).read_text())
     _state["user_index"] = json.loads(Path(local["user_index.json"]).read_text())
     _state["user_features"] = json.loads(Path(local["user_features.json"]).read_text())
-    _state["repo_embeddings"] = np.load(local["repo_embeddings.npy"])
-    _state["repo_lang_ids"] = np.load(local["repo_lang_ids.npy"])
 
-    cfg = _state["user_features"].get("__config__", {})
-    model = TwoTowerModel(
-        num_users=cfg.get("num_users", 1),
-        num_languages=cfg.get("num_languages", 50),
-        num_topics=cfg.get("num_topics", 200),
-    )
-    model.load_state_dict(torch.load(local["two_tower.pt"], map_location="cpu"))
-    model.eval()
-    _state["model"] = model
+    # Pre-computed embeddings — numpy only, no torch at serve time
+    repo_embs = np.load(local["repo_embeddings.npy"]).astype(np.float32)
+    # L2-normalise once so dot product == cosine similarity
+    norms = np.linalg.norm(repo_embs, axis=1, keepdims=True)
+    _state["repo_embeddings"] = repo_embs / np.where(norms > 0, norms, 1)
 
-    knn = ItemKNN()
-    data = np.load(local["knn_similarity.npz"])
-    import scipy.sparse as sp
-    knn.similarity_matrix = data["matrix"] if "matrix" in data else None
-    knn.repo_ids = list(_state["repo_index"].keys())
-    _state["knn"] = knn
     _state["ready"] = True
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _load_models()
+    _load_artifacts()
     yield
 
 
-app = FastAPI(title="GitMatch", description="GitHub Issues Recommender System", lifespan=lifespan)
+app = FastAPI(
+    title="GitMatch",
+    description="GitHub Issues Recommender System",
+    lifespan=lifespan,
+)
 
 
 class RecommendRequest(BaseModel):
@@ -111,30 +100,65 @@ def recommend(request: RecommendRequest):
     if not _state.get("ready"):
         raise HTTPException(status_code=503, detail="Models not yet loaded. Check /health.")
 
-    repos = recommend_repos(
-        username=request.username,
-        user_index=_state["user_index"],
-        repo_index=_state["repo_index"],
-        model=_state["model"],
-        knn=_state["knn"],
-        repo_embeddings=_state["repo_embeddings"],
-        repo_lang_ids=_state["repo_lang_ids"],
-        user_features=_state["user_features"],
-        top_k=request.top_k_repos,
+    username = request.username
+    user_features = _state["user_features"]
+    repo_index = _state["repo_index"]
+    repo_embs = _state["repo_embeddings"]
+
+    if username not in _state["user_index"]:
+        raise HTTPException(status_code=404, detail=f"User '{username}' not found in training data.")
+
+    feat = user_features.get(username, {})
+
+    # Stage 1 — numpy dot product against pre-normalised repo embeddings
+    if "user_embedding" in feat:
+        u_emb = np.array(feat["user_embedding"], dtype=np.float32)
+    else:
+        # Cold-start: use mean of contributed repo embeddings
+        contrib_ids = feat.get("contributed_repo_ids", [])
+        if contrib_ids:
+            u_emb = repo_embs[contrib_ids].mean(axis=0)
+        else:
+            raise HTTPException(status_code=404, detail="No contribution history found.")
+
+    scores = repo_embs @ u_emb
+    exclude = set(feat.get("contributed_repo_ids", []))
+    idx_to_repo = {v: k for k, v in repo_index.items()}
+
+    ranked_idxs = np.argsort(scores)[::-1]
+    top_repos = []
+    for idx in ranked_idxs:
+        if int(idx) in exclude:
+            continue
+        repo_name = idx_to_repo.get(int(idx), "")
+        langs = feat.get("top_languages", [])
+        topics = feat.get("top_topics", [])
+        explanation_parts = []
+        if langs:
+            explanation_parts.append(f"languages: {', '.join(langs[:3])}")
+        if topics:
+            explanation_parts.append(f"topics: {', '.join(topics[:3])}")
+        explanation = (
+            f"Matches your profile ({'; '.join(explanation_parts)})."
+            if explanation_parts else "Recommended based on your contribution history."
+        )
+        top_repos.append({"repo": repo_name, "explanation": explanation})
+        if len(top_repos) >= request.top_k_repos:
+            break
+
+    # Stage 2 — rank open issues within each repo via HF Inference API
+    user_emb = build_user_profile_embedding(
+        feat.get("pr_titles", []),
+        feat.get("pr_descriptions", []),
     )
 
-    user_feat = _state["user_features"].get(request.username, {})
-    pr_titles = user_feat.get("pr_titles", [])
-    pr_descriptions = user_feat.get("pr_descriptions", [])
-    user_emb = build_user_profile_embedding(pr_titles, pr_descriptions)
-
     results = []
-    for repo_rec in repos:
-        raw_issues = fetch_open_issues(repo_rec["repo"])
+    for rec in top_repos:
+        raw_issues = fetch_open_issues(rec["repo"])
         ranked = rank_issues(raw_issues, user_emb, top_k=request.top_k_issues)
         results.append(RepoResult(
-            repo=repo_rec["repo"],
-            explanation=repo_rec["explanation"],
+            repo=rec["repo"],
+            explanation=rec["explanation"],
             issues=[IssueResult(**i) for i in ranked],
         ))
 
