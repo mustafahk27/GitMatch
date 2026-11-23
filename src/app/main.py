@@ -20,50 +20,27 @@ from pydantic import BaseModel
 from src.recommendation.stage2_issues import rank_issues, build_user_profile_embedding
 from src.data_collection.github_api import fetch_open_issues, fetch_user_pr_history
 
-MODEL_CACHE_DIR = Path(os.getenv("MODEL_CACHE_DIR", "/tmp/gitmatch_models"))
-HF_REPO_ID = os.getenv("HF_REPO_ID", "mustafak27/gitmatch-models")
+DATA_DIR = Path(__file__).parent / "data"
 
 _state: dict = {}
 
 
 def _load_artifacts():
-    try:
-        from huggingface_hub import hf_hub_download
-    except ImportError:
-        return
+    repo_index = json.loads((DATA_DIR / "repo_index.json").read_text())
+    user_index = json.loads((DATA_DIR / "user_index.json").read_text())
 
-    MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    files = [
-        "repo_embeddings.npy", "repo_lang_ids.npy",
-        "repo_index.json", "user_index.json", "user_features.json",
-    ]
-    local = {}
-    for fname in files:
-        try:
-            local[fname] = hf_hub_download(
-                repo_id=HF_REPO_ID, filename=fname, repo_type="model", cache_dir=str(MODEL_CACHE_DIR)
-            )
-        except Exception:
-            return  # artifacts not yet uploaded
-
-    _state["repo_index"] = json.loads(Path(local["repo_index.json"]).read_text())
-    _state["user_index"] = json.loads(Path(local["user_index.json"]).read_text())
-    _state["user_features"] = json.loads(Path(local["user_features.json"]).read_text())
-
-    # Pre-computed embeddings — numpy only, no torch at serve time
-    repo_embs = np.load(local["repo_embeddings.npy"]).astype(np.float32)
-    # L2-normalise once so dot product == cosine similarity
+    repo_embs = np.load(str(DATA_DIR / "repo_embeddings.npy")).astype(np.float32)
     norms = np.linalg.norm(repo_embs, axis=1, keepdims=True)
-    _state["repo_embeddings"] = repo_embs / np.where(norms > 0, norms, 1)
 
+    _state["repo_index"] = repo_index
+    _state["user_index"] = user_index
+    _state["repo_embeddings"] = repo_embs / np.where(norms > 0, norms, 1)
     _state["ready"] = True
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import threading
-    t = threading.Thread(target=_load_artifacts, daemon=True)
-    t.start()
+    _load_artifacts()
     yield
 
 
@@ -150,17 +127,12 @@ def recommend(request: RecommendRequest):
         raise HTTPException(status_code=503, detail="Models not yet loaded. Check /health.")
 
     username = request.username
-    user_features = _state["user_features"]
     repo_index = _state["repo_index"]
     repo_embs = _state["repo_embeddings"]
 
-    # Cold-start: user not in training data — fetch their repos live from GitHub API
-    if username not in _state["user_index"]:
-        feat = _cold_start_features(username, repo_index, repo_embs)
-        if feat is None:
-            raise HTTPException(status_code=404, detail=f"GitHub user '{username}' not found or has no public contributions.")
-    else:
-        feat = user_features.get(username, {})
+    feat = _cold_start_features(username, repo_index, repo_embs)
+    if feat is None:
+        raise HTTPException(status_code=404, detail=f"GitHub user '{username}' not found or has no public contributions.")
 
     # Stage 1 — numpy dot product against pre-normalised repo embeddings
     if "user_embedding" in feat:
