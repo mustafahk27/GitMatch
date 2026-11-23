@@ -195,6 +195,43 @@ def _cold_start_features(username: str, repo_index: dict, repo_embs: np.ndarray,
     }
 
 
+_BORING = {
+    "that", "this", "with", "from", "have", "been", "will", "your", "their",
+    "which", "also", "more", "into", "than", "other", "used", "using", "based",
+    "open", "source", "code", "data", "work", "project", "tool", "library",
+    "system", "platform", "application", "build", "support", "provide", "include",
+    "make", "allow", "help", "easy", "simple", "new", "you", "not", "repository",
+    "repo", "github", "package", "interface", "implement", "feature", "version",
+    "user", "users", "file", "files", "list", "type", "types", "create", "object",
+}
+
+import re as _re
+
+
+def _per_repo_explanation(repo_name: str, repo_desc_index: dict, top_langs: list[str], user_text: str) -> str:
+    repo_text = repo_desc_index.get(repo_name, "")
+    if not repo_text:
+        return "Recommended based on your GitHub activity."
+
+    repo_tokens = set(_re.findall(r'[a-z][a-z0-9]{3,}', repo_text.lower())) - _BORING
+    user_tokens = set(_re.findall(r'[a-z][a-z0-9]{3,}', user_text.lower())) - _BORING
+
+    lang_hits = [l for l in top_langs if l.lower() in repo_text.lower()]
+    shared = sorted(repo_tokens & user_tokens, key=len, reverse=True)[:3]
+    notable = sorted(repo_tokens - _BORING, key=len, reverse=True)[:2]
+
+    if lang_hits and shared:
+        return f"Matches your {'/'.join(lang_hits[:2])} work — {', '.join(shared[:2])}."
+    if lang_hits:
+        extra = f" — {', '.join(notable)}" if notable else ""
+        return f"Aligns with your {'/'.join(lang_hits[:2])} projects{extra}."
+    if shared:
+        return f"Related to your interests in {', '.join(shared[:3])}."
+    if notable:
+        return f"Recommended based on your activity — {', '.join(notable)}."
+    return "Recommended based on your GitHub activity."
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "models_loaded": _state.get("ready", False)}
@@ -237,27 +274,20 @@ def recommend(request: RecommendRequest):
 
     ranked_idxs = np.argsort(scores)[::-1]
     langs = feat.get("top_languages", [])
-    signal_parts = feat.get("signal_parts", [])
     pr_repos = feat.get("pr_repos", [])
+    repo_desc_index = _state.get("repo_desc_index", {})
+
+    # Build user text for per-repo explanation matching
+    user_text_for_exp = " ".join(
+        feat.get("pr_titles", []) + feat.get("pr_descriptions", [])
+    )
 
     top_repos = []
     for idx in ranked_idxs:
         if int(idx) in exclude:
             continue
         repo_name = idx_to_repo.get(int(idx), "")
-        # Build a richer explanation
-        exp_parts = []
-        if pr_repos:
-            short = [r.split("/")[-1] for r in pr_repos[:2]]
-            exp_parts.append(f"similar to repos you've contributed to ({', '.join(short)})")
-        elif signal_parts:
-            exp_parts.extend(signal_parts)
-        if langs:
-            exp_parts.append(f"matches your {'/'.join(langs[:2])} profile")
-        explanation = (
-            "Recommended because " + "; ".join(exp_parts) + "."
-            if exp_parts else "Recommended based on your GitHub activity."
-        )
+        explanation = _per_repo_explanation(repo_name, repo_desc_index, langs, user_text_for_exp)
         top_repos.append({"repo": repo_name, "explanation": explanation})
         if len(top_repos) >= request.top_k_repos:
             break
