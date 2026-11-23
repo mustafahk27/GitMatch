@@ -2,15 +2,6 @@
 
 A deployed recommender system that takes a GitHub username and returns a ranked list of open-source repositories and issues the developer is likely to contribute to — with plain-language explanations for every recommendation.
 
-## Team
-
-| Name | Student ID |
-|------|-----------|
-| Mustafa Hussain Khan | 23K-0912 |
-| Hasnain Kazmi | 23K-0692 |
-| Shariq Hassan Khan | 23K-0626 |
-| Syed Attique Ur Rehman | 23K-0714 |
-
 ## Problem
 
 Finding a good first open-source contribution is hard. A developer must browse thousands of repositories and guess which issues match their skills. The "good first issue" label helps, but it has no knowledge of what the person has already built.
