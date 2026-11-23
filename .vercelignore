@@ -1,0 +1,14 @@
+.venv/
+venv/
+env/
+/data/
+notebooks/
+*.ipynb
+__pycache__/
+*.pyc
+*.egg-info/
+.git/
+docs/
+tests/
+results.json
+.env

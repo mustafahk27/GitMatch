@@ -23,7 +23,7 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 
-from src.models.two_tower import TwoTowerModel, InteractionDataset, train as train_two_tower
+from src.models.two_tower import TwoTowerModel, BPRDataset, train as train_two_tower
 from src.models.knn_baseline import ItemKNN
 from src.models.popularity_baseline import PopularityBaseline
 from src.evaluation.metrics import evaluate_model, catalogue_coverage
@@ -164,6 +164,16 @@ def main():
     # --- Two-Tower ---
     print("\nBuilding Two-Tower training dataset ...")
     idx_to_user = {v: k for k, v in user_index.items()}
+
+    # Pre-compute per-user mean repo embedding from training interactions (Fix 1)
+    train_csr = train_matrix.tocsr()
+    global_mean_emb = repo_embeddings.mean(axis=0).tolist()
+    user_mean_emb: dict[int, list] = {}
+    for u_idx in range(train_csr.shape[0]):
+        row = train_csr.getrow(u_idx)
+        if row.nnz > 0:
+            user_mean_emb[u_idx] = repo_embeddings[row.indices].mean(axis=0).tolist()
+
     cx = train_matrix.tocoo()
     positives = []
     for u_idx, r_idx in zip(cx.row, cx.col):
@@ -175,6 +185,7 @@ def main():
             "user_id": int(u_idx),
             "user_lang_ids": feat["lang_ids"],
             "user_topic_ids": feat["topic_ids"],
+            "mean_repo_emb": user_mean_emb.get(int(u_idx), global_mean_emb),
             "repo": {
                 "text_emb": repo_embeddings[r_idx].tolist(),
                 "lang_id": int(repo_lang_ids[r_idx]),
@@ -187,7 +198,7 @@ def main():
     ]
 
     model = TwoTowerModel(num_users=num_users, num_languages=num_languages, num_topics=num_topics)
-    dataset = InteractionDataset(positives, all_repos, num_negatives=4)
+    dataset = BPRDataset(positives, all_repos)
     print(f"Dataset size: {len(dataset):,} samples  ({len(positives):,} positives)")
 
     device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -213,8 +224,13 @@ def main():
         u_t = torch.tensor([user_id], dtype=torch.long)
         l_t = torch.tensor([feat["lang_ids"]], dtype=torch.long)
         tp_t = torch.tensor([feat["topic_ids"]], dtype=torch.long)
+        if train_history:
+            mean_emb = repo_embeddings[train_history].mean(axis=0)
+        else:
+            mean_emb = repo_embeddings.mean(axis=0)
+        mr_t = torch.from_numpy(np.array([mean_emb], dtype=np.float32))
         with torch.no_grad():
-            u_emb = model.encode_user(u_t.to(device), l_t.to(device), tp_t.to(device)).cpu().numpy()
+            u_emb = model.encode_user(u_t.to(device), l_t.to(device), tp_t.to(device), mr_t.to(device)).cpu().numpy()
         scores = (u_emb @ all_repo_embs.T).flatten()
         excl = set(train_history)
         ranked = [i for i in np.argsort(scores)[::-1] if i not in excl]

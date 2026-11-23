@@ -14,23 +14,23 @@ from torch.utils.data import DataLoader, Dataset
 
 
 class UserTower(nn.Module):
-    def __init__(self, num_users: int, num_languages: int, num_topics: int, embed_dim: int = 64, out_dim: int = 128):
+    def __init__(self, num_users: int, num_languages: int, num_topics: int, embed_dim: int = 64, out_dim: int = 128, repo_emb_dim: int = 384):
         super().__init__()
         self.user_embed = nn.Embedding(num_users, embed_dim)
         self.lang_embed = nn.Embedding(num_languages + 1, embed_dim, padding_idx=0)
         self.topic_embed = nn.Embedding(num_topics + 1, embed_dim, padding_idx=0)
         self.fc = nn.Sequential(
-            nn.Linear(embed_dim * 3, 256),
+            nn.Linear(embed_dim * 3 + repo_emb_dim, 256),
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(256, out_dim),
         )
 
-    def forward(self, user_ids: torch.Tensor, lang_ids: torch.Tensor, topic_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, user_ids: torch.Tensor, lang_ids: torch.Tensor, topic_ids: torch.Tensor, mean_repo_emb: torch.Tensor) -> torch.Tensor:
         u = self.user_embed(user_ids)
         l = self.lang_embed(lang_ids).mean(dim=1)
         t = self.topic_embed(topic_ids).mean(dim=1)
-        return F.normalize(self.fc(torch.cat([u, l, t], dim=-1)), dim=-1)
+        return F.normalize(self.fc(torch.cat([u, l, t, mean_repo_emb], dim=-1)), dim=-1)
 
 
 class RepoTower(nn.Module):
@@ -56,48 +56,47 @@ class TwoTowerModel(nn.Module):
         self.user_tower = UserTower(num_users, num_languages, num_topics, out_dim=out_dim)
         self.repo_tower = RepoTower(text_embed_dim, num_languages, out_dim=out_dim)
 
-    def forward(self, user_ids, user_lang_ids, user_topic_ids, repo_text_embs, repo_lang_ids) -> torch.Tensor:
-        user_emb = self.user_tower(user_ids, user_lang_ids, user_topic_ids)
+    def forward(self, user_ids, user_lang_ids, user_topic_ids, mean_repo_emb, repo_text_embs, repo_lang_ids) -> torch.Tensor:
+        user_emb = self.user_tower(user_ids, user_lang_ids, user_topic_ids, mean_repo_emb)
         repo_emb = self.repo_tower(repo_text_embs, repo_lang_ids)
         return (user_emb * repo_emb).sum(dim=-1)
 
-    def encode_user(self, user_ids, user_lang_ids, user_topic_ids) -> torch.Tensor:
-        return self.user_tower(user_ids, user_lang_ids, user_topic_ids)
+    def encode_user(self, user_ids, user_lang_ids, user_topic_ids, mean_repo_emb) -> torch.Tensor:
+        return self.user_tower(user_ids, user_lang_ids, user_topic_ids, mean_repo_emb)
 
     def encode_repo(self, repo_text_embs, repo_lang_ids) -> torch.Tensor:
         return self.repo_tower(repo_text_embs, repo_lang_ids)
 
 
-class InteractionDataset(Dataset):
-    def __init__(self, positives: list[dict], all_repos: list[dict], num_negatives: int = 4):
+class BPRDataset(Dataset):
+    """Bayesian Personalized Ranking dataset — returns (user, pos_repo, neg_repo) triplets."""
+
+    def __init__(self, positives: list[dict], all_repos: list[dict]):
         self.positives = positives
         self.all_repos = all_repos
-        self.num_negatives = num_negatives
-        self.repo_ids = list(range(len(all_repos)))
+        self.n_repos = len(all_repos)
 
     def __len__(self):
-        return len(self.positives) * (1 + self.num_negatives)
+        return len(self.positives)
 
     def __getitem__(self, idx):
-        pos_idx = idx // (1 + self.num_negatives)
-        is_positive = (idx % (1 + self.num_negatives)) == 0
-        pos = self.positives[pos_idx]
-        label = 1.0 if is_positive else 0.0
-        repo = pos["repo"] if is_positive else self.all_repos[np.random.randint(len(self.all_repos))]
+        pos = self.positives[idx]
+        neg = self.all_repos[np.random.randint(self.n_repos)]
         return {
             "user_id": pos["user_id"],
             "user_lang_ids": torch.tensor(pos["user_lang_ids"], dtype=torch.long),
             "user_topic_ids": torch.tensor(pos["user_topic_ids"], dtype=torch.long),
-            "repo_text_emb": torch.tensor(repo["text_emb"], dtype=torch.float),
-            "repo_lang_id": torch.tensor(repo["lang_id"], dtype=torch.long),
-            "label": torch.tensor(label, dtype=torch.float),
+            "mean_repo_emb": torch.tensor(pos["mean_repo_emb"], dtype=torch.float),
+            "pos_text_emb": torch.tensor(pos["repo"]["text_emb"], dtype=torch.float),
+            "pos_lang_id": torch.tensor(pos["repo"]["lang_id"], dtype=torch.long),
+            "neg_text_emb": torch.tensor(neg["text_emb"], dtype=torch.float),
+            "neg_lang_id": torch.tensor(neg["lang_id"], dtype=torch.long),
         }
 
 
-def train(model: TwoTowerModel, dataset: InteractionDataset, epochs: int = 10, lr: float = 1e-3, device: str = "cpu"):
+def train(model: TwoTowerModel, dataset: BPRDataset, epochs: int = 10, lr: float = 1e-3, device: str = "cpu"):
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_fn = nn.BCEWithLogitsLoss()
     loader = DataLoader(dataset, batch_size=512, shuffle=True, num_workers=0)
 
     for epoch in range(epochs):
@@ -105,14 +104,17 @@ def train(model: TwoTowerModel, dataset: InteractionDataset, epochs: int = 10, l
         total_loss = 0.0
         for batch in loader:
             optimizer.zero_grad()
-            scores = model(
+            u_emb = model.encode_user(
                 batch["user_id"].to(device),
                 batch["user_lang_ids"].to(device),
                 batch["user_topic_ids"].to(device),
-                batch["repo_text_emb"].to(device),
-                batch["repo_lang_id"].to(device),
+                batch["mean_repo_emb"].to(device),
             )
-            loss = loss_fn(scores, batch["label"].to(device))
+            pos_emb = model.encode_repo(batch["pos_text_emb"].to(device), batch["pos_lang_id"].to(device))
+            neg_emb = model.encode_repo(batch["neg_text_emb"].to(device), batch["neg_lang_id"].to(device))
+            pos_score = (u_emb * pos_emb).sum(dim=-1)
+            neg_score = (u_emb * neg_emb).sum(dim=-1)
+            loss = -F.logsigmoid(pos_score - neg_score).mean()
             loss.backward()
             optimizer.step()
             total_loss += loss.item()

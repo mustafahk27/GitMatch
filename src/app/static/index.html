@@ -203,6 +203,38 @@
       margin: 0 auto;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    .metrics-section {
+      width: 100%;
+      max-width: 760px;
+      margin-top: 56px;
+      border-top: 1px solid var(--border);
+      padding-top: 32px;
+    }
+    .metrics-section h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .metrics-section p {
+      color: var(--muted);
+      font-size: 0.82rem;
+      margin-bottom: 16px;
+    }
+    .metrics-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+    }
+    .metrics-table th, .metrics-table td {
+      border: 1px solid var(--border);
+      padding: 7px 12px;
+      text-align: center;
+    }
+    .metrics-table th { background: var(--tag-bg); color: var(--muted); font-weight: 600; }
+    .metrics-table td:first-child { text-align: left; font-weight: 500; }
+    .metrics-table tr.nn-row td { color: #3fb950; }
+    .metrics-note { color: var(--muted); font-size: 0.78rem; margin-top: 8px; }
   </style>
 </head>
 <body>
@@ -218,6 +250,7 @@
 
   <div id="status"></div>
   <div id="results"></div>
+  <div class="metrics-section" id="metricsSection" style="display:none"></div>
 
   <script>
     const form = document.getElementById('searchForm');
@@ -321,6 +354,41 @@
     function escHtml(str) {
       return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
     }
+
+    // Load and render evaluation metrics table
+    async function loadMetrics() {
+      try {
+        const res = await fetch('/metrics');
+        if (!res.ok) return;
+        const data = await res.json();
+        const models = Object.keys(data);
+        if (!models.length) return;
+        const ks = [5, 10, 20];
+        const rows = models.map(model => {
+          const isNN = model.toLowerCase().includes('tower') || model.toLowerCase().includes('nn');
+          const cells = ks.flatMap(k => {
+            const m = data[model];
+            const pk = m[`P@${k}`] ?? '—';
+            const rk = m[`R@${k}`] ?? '—';
+            const nk = m[`NDCG@${k}`] ?? '—';
+            return [pk, rk, nk].map(v => `<td>${typeof v === 'number' ? v.toFixed(4) : v}</td>`);
+          });
+          return `<tr class="${isNN ? 'nn-row' : ''}"><td>${escHtml(model)}</td>${cells.join('')}</tr>`;
+        });
+        const headers = ks.flatMap(k => [`P@${k}`, `R@${k}`, `NDCG@${k}`]).map(h => `<th>${h}</th>`).join('');
+        const section = document.getElementById('metricsSection');
+        section.innerHTML = `
+          <h2>Offline Evaluation</h2>
+          <p>Precision@K, Recall@K and NDCG@K on a held-out 15% test split (Two-Tower NN highlighted in green).</p>
+          <table class="metrics-table">
+            <thead><tr><th>Model</th>${headers}</tr></thead>
+            <tbody>${rows.join('')}</tbody>
+          </table>
+          <p class="metrics-note">Test set: ~1,300 held-out interactions across 744 users. Higher is better.</p>`;
+        section.style.display = 'block';
+      } catch (_) {}
+    }
+    loadMetrics();
   </script>
 </body>
 </html>

@@ -104,8 +104,8 @@ def fetch_open_issues(full_name: str, label: str = "good first issue", per_page:
     ]
 
 
-def fetch_user_pr_history(username: str, max_prs: int = 30) -> tuple[list[str], list[str]]:
-    """Return (pr_titles, pr_bodies) for a user's recently merged PRs via search API."""
+def fetch_user_pr_history(username: str, max_prs: int = 30) -> tuple[list[str], list[str], list[str]]:
+    """Return (pr_titles, pr_bodies, contributed_repo_names) for a user's recently merged PRs."""
     params = {
         "q": f"type:pr author:{username} is:merged",
         "per_page": max_prs,
@@ -113,10 +113,18 @@ def fetch_user_pr_history(username: str, max_prs: int = 30) -> tuple[list[str], 
     }
     data = _get(f"{BASE_URL}/search/issues", params=params)
     if not data or "items" not in data:
-        return [], []
+        return [], [], []
     titles = [item.get("title", "") for item in data["items"]]
     bodies = [(item.get("body") or "")[:300] for item in data["items"]]
-    return titles, bodies
+    # repository_url looks like https://api.github.com/repos/owner/name
+    repo_names = []
+    for item in data["items"]:
+        repo_url = item.get("repository_url", "")
+        if repo_url:
+            parts = repo_url.split("/repos/", 1)
+            if len(parts) == 2:
+                repo_names.append(parts[1])
+    return titles, bodies, repo_names
 
 
 def collect_repo_metadata(repo_list_path: str):
