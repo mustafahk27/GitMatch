@@ -13,10 +13,12 @@ from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.recommendation.stage2_issues import rank_issues, build_user_profile_embedding
-from src.data_collection.github_api import fetch_open_issues
+from src.data_collection.github_api import fetch_open_issues, fetch_user_pr_history
 
 MODEL_CACHE_DIR = Path(os.getenv("MODEL_CACHE_DIR", "/tmp/gitmatch_models"))
 HF_REPO_ID = os.getenv("HF_REPO_ID", "mustafahk27/gitmatch-models")
@@ -63,11 +65,15 @@ async def lifespan(app: FastAPI):
     yield
 
 
+STATIC_DIR = Path(__file__).parent / "static"
+
 app = FastAPI(
     title="GitMatch",
     description="GitHub Issues Recommender System",
     lifespan=lifespan,
 )
+
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 class RecommendRequest(BaseModel):
@@ -90,6 +96,47 @@ class RepoResult(BaseModel):
     issues: list[IssueResult]
 
 
+@app.get("/", include_in_schema=False)
+def index():
+    return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+def _cold_start_features(username: str, repo_index: dict, repo_embs: np.ndarray) -> dict | None:
+    """Build a minimal feature dict for a user not seen during training."""
+    from src.data_collection.github_api import _get as gh_get
+    # Fetch user's public repos
+    data = gh_get(f"https://api.github.com/users/{username}/repos", {"per_page": 50, "sort": "pushed"})
+    if not data:
+        return None
+    repo_names = [r["full_name"] for r in data if not r.get("fork")]
+    if not repo_names:
+        return None
+
+    idx_to_find = [repo_index[r] for r in repo_names if r in repo_index]
+    if idx_to_find:
+        u_emb = repo_embs[idx_to_find].mean(axis=0)
+        norm = np.linalg.norm(u_emb)
+        u_emb = u_emb / norm if norm > 0 else u_emb
+    else:
+        # No overlap with known repos — use mean of all embeddings (popularity fallback)
+        u_emb = repo_embs.mean(axis=0)
+
+    langs = [r.get("language") for r in data if r.get("language")]
+    from collections import Counter
+    top_langs = [l for l, _ in Counter(langs).most_common(3)]
+
+    pr_titles, pr_descriptions = fetch_user_pr_history(username)
+
+    return {
+        "contributed_repo_ids": idx_to_find,
+        "top_languages": top_langs,
+        "top_topics": [],
+        "user_embedding": u_emb.tolist(),
+        "pr_titles": pr_titles,
+        "pr_descriptions": pr_descriptions,
+    }
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "models_loaded": _state.get("ready", False)}
@@ -105,10 +152,13 @@ def recommend(request: RecommendRequest):
     repo_index = _state["repo_index"]
     repo_embs = _state["repo_embeddings"]
 
+    # Cold-start: user not in training data — fetch their repos live from GitHub API
     if username not in _state["user_index"]:
-        raise HTTPException(status_code=404, detail=f"User '{username}' not found in training data.")
-
-    feat = user_features.get(username, {})
+        feat = _cold_start_features(username, repo_index, repo_embs)
+        if feat is None:
+            raise HTTPException(status_code=404, detail=f"GitHub user '{username}' not found or has no public contributions.")
+    else:
+        feat = user_features.get(username, {})
 
     # Stage 1 — numpy dot product against pre-normalised repo embeddings
     if "user_embedding" in feat:

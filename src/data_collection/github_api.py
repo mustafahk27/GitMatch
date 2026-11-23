@@ -97,6 +97,21 @@ def fetch_open_issues(full_name: str, label: str = "good first issue", per_page:
     ]
 
 
+def fetch_user_pr_history(username: str, max_prs: int = 30) -> tuple[list[str], list[str]]:
+    """Return (pr_titles, pr_bodies) for a user's recently merged PRs via search API."""
+    params = {
+        "q": f"type:pr author:{username} is:merged",
+        "per_page": max_prs,
+        "sort": "updated",
+    }
+    data = _get(f"{BASE_URL}/search/issues", params=params)
+    if not data or "items" not in data:
+        return [], []
+    titles = [item.get("title", "") for item in data["items"]]
+    bodies = [(item.get("body") or "")[:300] for item in data["items"]]
+    return titles, bodies
+
+
 def collect_repo_metadata(repo_list_path: str):
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
     repos = Path(repo_list_path).read_text().strip().splitlines()
